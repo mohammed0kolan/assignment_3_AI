@@ -1,8 +1,3 @@
-// Ant in a Flooded Maze: Greedy and A* with Euclidean (h1) / Manhattan (h2).
-// The maze is a 2D array in main(): 'B' wall, 'W' free, 'G' flooded,
-// 'S' = ant start (free cell), 'X' = food/goal (free cell).
-// Usage: ./maze_search [maxAir A (default 3)] [startRow startCol]   (0-based start override)
-
 #include <iostream>
 #include <vector>
 #include <queue>
@@ -13,115 +8,155 @@
 #include <algorithm>
 #include <string>
 #include <iomanip>
+#include <cstdlib>
+
 using namespace std;
 
-// A state = position + remaining air (air matters: it limits future moves).
 struct State {
-    int r, c, air;
-    bool operator<(const State& o) const { return tie(r, c, air) < tie(o.r, o.c, o.air); }
+    int row, col, air;
+
+    bool operator<(const State& other) const {
+        return tie(row, col, air) < tie(other.row, other.col, other.air);
+    }
 };
 
-// One search-tree node: state, path cost g, heuristic h, link to parent.
 struct Node {
-    State s;
-    int g;
-    double h;
-    int parent;  // index into the node pool, -1 for the root
+    State state;
+    int cost;
+    double estimate;
+    int parent;
 };
 
 struct Result {
     bool found = false;
     int cost = 0;
-    long expanded = 0, generated = 0, maxFrontier = 0;
-    double ms = 0;
+    long expanded = 0;
+    long generated = 0;
+    long biggestFrontier = 0;
+    double timeMs = 0;
     vector<State> path;
 };
 
 class Maze {
 public:
-    int M, N, A;
+    int rows, cols, maxAir;
     vector<vector<char>> grid;
     State start{0, 0, 0};
-    int goalR = -1, goalC = -1;
+    int goalRow = -1;
+    int goalCol = -1;
 
-    // Takes the 2D array directly and finds 'S' and 'X' in it.
-    Maze(const vector<vector<char>>& g, int maxAir) : M(g.size()), N(g[0].size()), A(maxAir), grid(g) {
-        for (int r = 0; r < M; r++)
-            for (int c = 0; c < N; c++) {
-                if (grid[r][c] == 'S') { start = {r, c, A}; grid[r][c] = 'W'; }  // starts with full air
-                if (grid[r][c] == 'X') { goalR = r; goalC = c; grid[r][c] = 'W'; }
+    Maze(const vector<vector<char>>& input, int air) {
+        grid = input;
+        rows = grid.size();
+        cols = grid[0].size();
+        maxAir = air;
+
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                if (grid[r][c] == 'S') {
+                    start = {r, c, maxAir};
+                    grid[r][c] = 'W';
+                }
+                if (grid[r][c] == 'X') {
+                    goalRow = r;
+                    goalCol = c;
+                    grid[r][c] = 'W';
+                }
             }
-    }
-
-    bool isGoal(const State& s) const { return s.r == goalR && s.c == goalC; }
-
-    // h1: straight-line distance. h2: |dx| + |dy|. Both ignore walls and air.
-    double h(const State& s, int which) const {
-        double dx = abs(s.r - goalR), dy = abs(s.c - goalC);
-        return which == 1 ? sqrt(dx * dx + dy * dy) : dx + dy;
-    }
-
-    // All legal successors: 4 moves + stay. Every action costs 1.
-    vector<State> successors(const State& s) const {
-        static const int dr[] = {-1, 1, 0, 0, 0}, dc[] = {0, 0, -1, 1, 0};
-        vector<State> out;
-        for (int k = 0; k < 5; k++) {
-            int nr = s.r + dr[k], nc = s.c + dc[k];
-            if (nr < 0 || nc < 0 || nr >= M || nc >= N || grid[nr][nc] == 'B') continue;
-            int air = s.air;
-            if (grid[nr][nc] == 'G') {          // flooded: entering/staying uses 1 air
-                if (--air < 0) continue;        // air can never drop below 0
-            } else air = A;                     // free cell: air refilled to A
-            out.push_back({nr, nc, air});
         }
-        return out;
+    }
+
+    bool isGoal(const State& s) const {
+        return s.row == goalRow && s.col == goalCol;
+    }
+
+    double heuristic(const State& s, int hType) const {
+        double dr = abs(s.row - goalRow);
+        double dc = abs(s.col - goalCol);
+        if (hType == 1) return sqrt(dr * dr + dc * dc);
+        return dr + dc;
+    }
+
+    vector<State> getNextStates(const State& s) const {
+        int dr[] = {-1, 1, 0, 0, 0};
+        int dc[] = {0, 0, -1, 1, 0};
+        vector<State> next;
+
+        for (int i = 0; i < 5; i++) {
+            int r = s.row + dr[i];
+            int c = s.col + dc[i];
+
+            if (r < 0 || c < 0 || r >= rows || c >= cols) continue;
+            if (grid[r][c] == 'B') continue;
+
+            int air = s.air;
+            if (grid[r][c] == 'G') {
+                air--;
+                if (air < 0) continue;
+            } else {
+                air = maxAir;
+            }
+            next.push_back({r, c, air});
+        }
+        return next;
     }
 };
 
-// algo: "greedy" -> f = h ; "astar" -> f = g + h.  which: 1 = Euclidean, 2 = Manhattan.
-Result search(const Maze& m, const string& algo, int which) {
-    auto t0 = chrono::steady_clock::now();
-    Result res;
-    vector<Node> pool;
-    // frontier entry: (f, insertion order, node index) -> min-heap, ties by insertion order
-    using Entry = tuple<double, long, int>;
-    priority_queue<Entry, vector<Entry>, greater<Entry>> frontier;
-    set<State> closed;  // explored set keyed by (row, col, air): avoids repeated states
+Result search(const Maze& maze, string algorithm, int hType) {
+    auto startTime = chrono::steady_clock::now();
+    Result result;
+    vector<Node> nodes;
+    using Item = tuple<double, long, int>;
+    priority_queue<Item, vector<Item>, greater<Item>> open;
+    set<State> visited;
     long order = 0;
 
-    auto f = [&](const Node& n) { return algo == "greedy" ? n.h : n.g + n.h; };
-    pool.push_back({m.start, 0, m.h(m.start, which), -1});
-    frontier.push({f(pool[0]), order++, 0});
-    res.generated = 1;
+    auto priority = [&](const Node& n) {
+        if (algorithm == "greedy") return n.estimate;
+        return n.cost + n.estimate;
+    };
 
-    while (!frontier.empty()) {
-        res.maxFrontier = max<long>(res.maxFrontier, frontier.size());
-        int idx = get<2>(frontier.top());
-        frontier.pop();
-        Node cur = pool[idx];
-        if (closed.count(cur.s)) continue;          // this exact state was already expanded
-        if (m.isGoal(cur.s)) {                      // goal test when the node is expanded
-            res.found = true;
-            res.cost = cur.g;
-            for (int i = idx; i != -1; i = pool[i].parent) res.path.push_back(pool[i].s);
-            reverse(res.path.begin(), res.path.end());
+    nodes.push_back({maze.start, 0, maze.heuristic(maze.start, hType), -1});
+    open.push({priority(nodes[0]), order++, 0});
+    result.generated++;
+
+    while (!open.empty()) {
+        result.biggestFrontier = max<long>(result.biggestFrontier, open.size());
+        int index = get<2>(open.top());
+        open.pop();
+
+        Node current = nodes[index];
+        if (visited.count(current.state)) continue;
+
+        if (maze.isGoal(current.state)) {
+            result.found = true;
+            result.cost = current.cost;
+            for (int i = index; i != -1; i = nodes[i].parent) {
+                result.path.push_back(nodes[i].state);
+            }
+            reverse(result.path.begin(), result.path.end());
             break;
         }
-        closed.insert(cur.s);
-        res.expanded++;
-        for (const State& ns : m.successors(cur.s)) {
-            if (closed.count(ns)) continue;
-            pool.push_back({ns, cur.g + 1, m.h(ns, which), idx});
-            frontier.push({f(pool.back()), order++, (int)pool.size() - 1});
-            res.generated++;
+
+        visited.insert(current.state);
+        result.expanded++;
+
+        vector<State> next = maze.getNextStates(current.state);
+        for (const State& state : next) {
+            if (visited.count(state)) continue;
+            nodes.push_back({state, current.cost + 1,
+                             maze.heuristic(state, hType), index});
+            open.push({priority(nodes.back()), order++, (int)nodes.size() - 1});
+            result.generated++;
         }
     }
-    res.ms = chrono::duration<double, milli>(chrono::steady_clock::now() - t0).count();
-    return res;
+
+    result.timeMs = chrono::duration<double, milli>(
+        chrono::steady_clock::now() - startTime).count();
+    return result;
 }
 
 int main(int argc, char** argv) {
-    // The professor's maze.
     vector<vector<char>> grid = {
         {'B', 'B', 'B', 'B', 'B', 'B', 'B'},
         {'B', 'W', 'W', 'W', 'W', 'X', 'B'},
@@ -132,27 +167,35 @@ int main(int argc, char** argv) {
         {'B', 'B', 'B', 'B', 'B', 'B', 'B'}
     };
 
-    int maxAir = argc >= 2 ? atoi(argv[1]) : 3;
-    Maze m(grid, maxAir);
-    if (argc >= 4) m.start = {atoi(argv[2]), atoi(argv[3]), maxAir};
+    int maxAir = argc > 1 ? atoi(argv[1]) : 3;
+    Maze maze(grid, maxAir);
+    if (argc >= 4) {
+        maze.start = {atoi(argv[2]), atoi(argv[3]), maxAir};
+    }
 
-    cout << "Start=(" << m.start.r << "," << m.start.c << ") Goal=(" << m.goalR << "," << m.goalC
-         << ") A=" << m.A << "\n\n";
-    cout << left << setw(10) << "Algo" << setw(5) << "h" << setw(8) << "Found" << setw(6) << "Cost"
-         << setw(10) << "Expanded" << setw(11) << "Generated" << setw(9) << "MaxFront"
-         << "Time(ms)\n";
+    cout << "Start=(" << maze.start.row << "," << maze.start.col << ") Goal=("
+         << maze.goalRow << "," << maze.goalCol << ") A=" << maze.maxAir << "\n\n";
+    cout << left << setw(10) << "Algo" << setw(5) << "h" << setw(8) << "Found"
+         << setw(6) << "Cost" << setw(10) << "Expanded" << setw(11) << "Generated"
+         << setw(9) << "MaxFront" << "Time(ms)\n";
 
-    for (string algo : {"greedy", "astar"})
-        for (int which : {1, 2}) {
-            Result r = search(m, algo, which);
-            cout << left << setw(10) << algo << setw(5) << ("h" + to_string(which))
-                 << setw(8) << (r.found ? "yes" : "NO") << setw(6) << (r.found ? to_string(r.cost) : "-")
-                 << setw(10) << r.expanded << setw(11) << r.generated << setw(9) << r.maxFrontier
-                 << fixed << setprecision(3) << r.ms << "\n";
-            if (r.found) {
+    for (string algorithm : {"greedy", "astar"}) {
+        for (int hType : {1, 2}) {
+            Result result = search(maze, algorithm, hType);
+            cout << left << setw(10) << algorithm << setw(5) << ("h" + to_string(hType))
+                 << setw(8) << (result.found ? "yes" : "NO")
+                 << setw(6) << (result.found ? to_string(result.cost) : "-")
+                 << setw(10) << result.expanded << setw(11) << result.generated
+                 << setw(9) << result.biggestFrontier << fixed << setprecision(3)
+                 << result.timeMs << "\n";
+
+            if (result.found) {
                 cout << "   path: ";
-                for (auto& s : r.path) cout << "(" << s.r << "," << s.c << ",a" << s.air << ") ";
+                for (const State& s : result.path) {
+                    cout << "(" << s.row << "," << s.col << ",a" << s.air << ") ";
+                }
                 cout << "\n";
             }
         }
+    }
 }
